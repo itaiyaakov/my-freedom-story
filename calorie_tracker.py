@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import json
 import os
+import io
 from datetime import date, timedelta, datetime
 
 # ─── קבועים ─────────────────────────────────────────────────────────────────
@@ -84,12 +85,143 @@ def calc_tdee(bmr, activity_level):
 
 
 def days_to_goal(current_weight, goal_weight, daily_deficit):
-    """מחשב כמה ימים לגיע ליעד לפי גרעון יומי."""
     weight_diff = current_weight - goal_weight
     if weight_diff <= 0 or daily_deficit <= 0:
         return None
     calories_to_burn = weight_diff * 7700
     return int(calories_to_burn / daily_deficit)
+
+
+# ─── יצוא אקסל ───────────────────────────────────────────────────────────────
+def generate_excel(data):
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = openpyxl.Workbook()
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(fill_type="solid", fgColor="1E3A8A")
+
+    def style_header(cell):
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # ── גיליון 1: יומן יומי ──
+    ws1 = wb.active
+    ws1.title = "יומן יומי"
+    ws1.sheet_view.rightToLeft = True
+    headers = ["תאריך", "סוג", "פריט", "קלוריות", "כמות"]
+    for col, h in enumerate(headers, 1):
+        cell = ws1.cell(row=1, column=col, value=h)
+        style_header(cell)
+    ws1.column_dimensions["A"].width = 14
+    ws1.column_dimensions["C"].width = 28
+
+    row = 2
+    for date_key in sorted(data.get("diary", {}).keys()):
+        day = data["diary"][date_key]
+        for item in day.get("food", []):
+            ws1.cell(row=row, column=1, value=date_key)
+            ws1.cell(row=row, column=2, value="מזון")
+            ws1.cell(row=row, column=3, value=item["name"])
+            ws1.cell(row=row, column=4, value=item["cal"])
+            ws1.cell(row=row, column=5, value=item.get("qty", 1))
+            row += 1
+        for item in day.get("drinks", []):
+            ws1.cell(row=row, column=1, value=date_key)
+            ws1.cell(row=row, column=2, value="שתייה")
+            ws1.cell(row=row, column=3, value=item["name"])
+            ws1.cell(row=row, column=4, value=item["cal"])
+            ws1.cell(row=row, column=5, value=item.get("qty", 1))
+            row += 1
+        for item in day.get("activities", []):
+            ws1.cell(row=row, column=1, value=date_key)
+            ws1.cell(row=row, column=2, value="פעילות")
+            ws1.cell(row=row, column=3, value=item["name"])
+            ws1.cell(row=row, column=4, value=-item["cal"])
+            ws1.cell(row=row, column=5, value=1)
+            row += 1
+
+    # ── גיליון 2: מעקב משקל ──
+    ws2 = wb.create_sheet("מעקב משקל")
+    ws2.sheet_view.rightToLeft = True
+    for col, h in enumerate(["תאריך", "משקל (ק\"ג)"], 1):
+        style_header(ws2.cell(row=1, column=col, value=h))
+    ws2.column_dimensions["A"].width = 14
+    for i, (dk, w) in enumerate(sorted(data.get("weight_log", {}).items()), 2):
+        ws2.cell(row=i, column=1, value=dk)
+        ws2.cell(row=i, column=2, value=w)
+
+    # ── גיליון 3: פרופיל ──
+    ws3 = wb.create_sheet("פרופיל")
+    ws3.sheet_view.rightToLeft = True
+    profile = data.get("profile", {})
+    fields = [
+        ("שם", "name"), ("גיל", "age"), ("גובה (ס\"מ)", "height"),
+        ("מגדר", "gender"), ("משקל נוכחי (ק\"ג)", "weight"),
+        ("משקל יעד (ק\"ג)", "goal_weight"), ("BMR", "bmr"), ("TDEE", "tdee"),
+        ("גרעון יומי מבוקש", "deficit_target"),
+    ]
+    ws3.column_dimensions["A"].width = 22
+    ws3.column_dimensions["B"].width = 18
+    for i, (label, key) in enumerate(fields, 1):
+        cell = ws3.cell(row=i, column=1, value=label)
+        cell.font = Font(bold=True)
+        ws3.cell(row=i, column=2, value=profile.get(key, ""))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ─── ביקורת AI ───────────────────────────────────────────────────────────────
+def ai_meal_review(day_data, profile, api_key):
+    import anthropic
+
+    food_lines  = [f"• {i['name']} ({i['cal']} קל)" for i in day_data.get("food", [])]
+    drink_lines = [f"• {i['name']} ({i['cal']} קל)" for i in day_data.get("drinks", [])]
+    act_lines   = [f"• {i['name']} (שרפה {i['cal']} קל)" for i in day_data.get("activities", [])]
+
+    total_in  = sum(i["cal"] for i in day_data.get("food", [])) + \
+                sum(i["cal"] for i in day_data.get("drinks", []))
+    total_burn= sum(i["cal"] for i in day_data.get("activities", []))
+    tdee      = profile.get("tdee", 2000)
+    target    = tdee - profile.get("deficit_target", 500)
+
+    prompt = f"""אתה דיאטנית מומחית ומעודדת. בקר את הרישום התזונתי הבא בעברית בלבד.
+
+**מזון שנאכל היום:**
+{chr(10).join(food_lines) if food_lines else "לא הוזן מזון"}
+
+**שתייה:**
+{chr(10).join(drink_lines) if drink_lines else "לא הוזן"}
+
+**פעילות גופנית:**
+{chr(10).join(act_lines) if act_lines else "לא הוזן"}
+
+**סה"כ קלוריות שנצרכו:** {total_in} קל
+**שריפה בפעילות:** {total_burn} קל
+**נטו:** {total_in - total_burn} קל
+**יעד יומי:** {target:.0f} קל
+
+כתוב ביקורת קצרה ומועילה הכוללת בדיוק את 4 הסעיפים הבאים:
+
+✅ **מה עשית טוב** – ציין 2-3 דברים חיוביים ספציפיים
+⚠️ **מה כדאי לשפר** – ציין 1-2 בעיות תזונתיות
+🔄 **חלופות בריאות יותר** – לכל פריט לא בריא שהוזן, הצע חלופה ספציפית (למשל: "במקום ציפס — נסה גזר עם חומוס")
+💡 **טיפ אחד להמשך** – עצה מעשית אחת לשיפור מחר
+
+היה ספציפי לפריטים שהוזנו. אל תחזור על הרשימה. כתוב בשפה עברית חמה ומעודדת."""
+
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return message.content[0].text
 
 
 # ─── CSS ─────────────────────────────────────────────────────────────────────
@@ -137,6 +269,14 @@ def apply_css():
         padding-bottom: 6px;
         border-bottom: 2px solid #e2e8f0;
     }
+    .ai-review-box {
+        background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+        border-radius: 16px;
+        padding: 24px;
+        border: 1px solid #bae6fd;
+        margin-top: 16px;
+        line-height: 1.8;
+    }
     div[data-testid="stNumberInput"] { direction: ltr; }
     </style>
     """, unsafe_allow_html=True)
@@ -176,7 +316,6 @@ def page_profile(data):
             "activity": activity, "deficit_target": deficit_target,
             "bmr": round(bmr), "tdee": round(tdee),
         }
-        # רשום משקל ראשוני ב-log אם אין
         today = str(date.today())
         if today not in data["weight_log"]:
             data["weight_log"][today] = weight
@@ -345,7 +484,7 @@ def page_diary(data):
     profile = data.get("profile", {})
     tdee    = profile.get("tdee", 2000)
     target  = tdee - profile.get("deficit_target", 500)
-    balance = target - net_cal  # חיובי = גרעון (טוב לירידה)
+    balance = target - net_cal
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -377,7 +516,6 @@ def page_diary(data):
             <small style='font-weight:400;color:#475569'>יעד יומי: {target:,.0f} קל | TDEE: {tdee:,} קל</small>
         </div>""", unsafe_allow_html=True)
 
-        # Progress bar
         pct = min(1.0, net_cal / target) if target > 0 else 0
         st.progress(pct, text=f"נצרכו {pct*100:.0f}% מהיעד היומי")
 
@@ -392,6 +530,33 @@ def page_diary(data):
         fig.update_layout(font=dict(family="Arial"), title_x=0.5)
         st.plotly_chart(fig, use_container_width=True)
 
+    # ─── ביקורת AI ───────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🤖 ביקורת תזונה חכמה")
+
+    api_key = st.session_state.get("anthropic_api_key", "")
+    has_entries = bool(day["food"] or day["drinks"])
+
+    if not api_key:
+        st.info("הזן מפתח API של Anthropic בסרגל הצד כדי לקבל ביקורת תזונה מ-AI")
+    elif not has_entries:
+        st.info("הזן מאכלים או שתייה כדי לקבל ביקורת תזונה")
+    else:
+        if st.button("🔍 בקש ביקורת תזונה מה-AI", use_container_width=True, type="primary"):
+            with st.spinner("הדיאטנית החכמה מנתחת את הארוחות שלך..."):
+                try:
+                    review = ai_meal_review(day, profile, api_key)
+                    st.session_state["last_review"] = review
+                    st.session_state["last_review_date"] = day_key
+                except Exception as e:
+                    st.error(f"שגיאה בקריאה ל-AI: {e}")
+
+        if st.session_state.get("last_review") and st.session_state.get("last_review_date") == day_key:
+            st.markdown(
+                f"<div class='ai-review-box'>{st.session_state['last_review'].replace(chr(10), '<br>')}</div>",
+                unsafe_allow_html=True
+            )
+
 
 # ─── עמוד: דשבורד ────────────────────────────────────────────────────────────
 def page_dashboard(data):
@@ -401,6 +566,22 @@ def page_dashboard(data):
     if not profile:
         st.info("מלא קודם את הפרופיל האישי שלך")
         return
+
+    # ─── יצוא אקסל ───────────────────────────────────────────────────────────
+    col_export, _ = st.columns([1, 3])
+    with col_export:
+        try:
+            excel_bytes = generate_excel(data)
+            filename = f"calorie_tracker_{date.today().strftime('%Y%m%d')}.xlsx"
+            st.download_button(
+                label="📥 יצא לאקסל",
+                data=excel_bytes,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        except ImportError:
+            st.warning("נדרש: pip install openpyxl")
 
     tdee   = profile.get("tdee", 2000)
     target = tdee - profile.get("deficit_target", 500)
@@ -420,7 +601,6 @@ def page_dashboard(data):
         cals_burn.append(tburn)
         cals_net.append(tin - tburn)
 
-    # גרף קלוריות שבועי
     fig = go.Figure()
     fig.add_bar(name="צריכה", x=dates, y=cals_in, marker_color="#ef4444")
     fig.add_bar(name="שריפה", x=dates, y=cals_burn, marker_color="#10b981")
@@ -434,7 +614,6 @@ def page_dashboard(data):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ─── גרעון/עודף שבועי ─────────────────────────────────────────────────────
     deficits = [target - n for n in cals_net]
     colors_d = ["#10b981" if d >= 0 else "#ef4444" for d in deficits]
     fig2 = go.Figure(go.Bar(
@@ -522,10 +701,9 @@ def page_dashboard(data):
             <p class='metric-value' style='color:{color}'>{abs(est_loss):.2f}</p>
             <p class='metric-label'>ק\"ג השבוע</p></div>""", unsafe_allow_html=True)
 
-    # ─── מד התקדמות יעד ──────────────────────────────────────────────────────
     wlog_sorted = sorted(data.get("weight_log", {}).items())
     if wlog_sorted:
-        start_w = wlog_sorted[0][1]
+        start_w  = wlog_sorted[0][1]
         latest_w = wlog_sorted[-1][1]
         if start_w > goal_w:
             total_to_lose = start_w - goal_w
@@ -548,6 +726,34 @@ def main():
         layout="wide",
     )
     apply_css()
+
+    # ─── מפתח API בסרגל הצד ──────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### 🤖 הגדרות AI")
+        # נסה לטעון ממשתנה סביבה / secrets
+        default_key = ""
+        try:
+            default_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            default_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if default_key:
+            st.session_state["anthropic_api_key"] = default_key
+            st.success("מפתח API נטען אוטומטית ✓")
+        else:
+            entered_key = st.text_input(
+                "מפתח Anthropic API",
+                value=st.session_state.get("anthropic_api_key", ""),
+                type="password",
+                placeholder="sk-ant-...",
+                help="נדרש לביקורת תזונה חכמה. ניתן לקבל ב-console.anthropic.com",
+            )
+            if entered_key:
+                st.session_state["anthropic_api_key"] = entered_key
+
+        st.markdown("---")
+        st.markdown("### 📱 קיצורי דרך")
+        st.markdown("שמור כ-PWA בסאפרי לגישה מהירה מהמסך הראשי")
 
     data = load_data()
 
