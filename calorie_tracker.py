@@ -4,6 +4,7 @@ import plotly.express as px
 import json
 import os
 import io
+import base64
 from datetime import date, timedelta, datetime
 
 # ─── קבועים ─────────────────────────────────────────────────────────────────
@@ -224,6 +225,44 @@ def ai_meal_review(day_data, profile, api_key):
     return message.content[0].text
 
 
+# ─── זיהוי מזון מתמונה ───────────────────────────────────────────────────────
+def analyze_food_photo(image_bytes, media_type, api_key):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    message = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": image_data},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "זהה את כל פריטי המזון בתמונה ואמוד את הקלוריות של כל אחד.\n"
+                        "החזר JSON בלבד (ללא טקסט נוסף), בפורמט:\n"
+                        "{\"items\": [{\"name\": \"שם בעברית\", \"cal\": 250, \"qty\": 1}, ...]}\n"
+                        "היה ספציפי לגבי הכמות/גודל המנה. אם אינך בטוח, אמוד בצד הגבוה."
+                    ),
+                },
+            ],
+        }],
+    )
+
+    text = message.content[0].text.strip()
+    if "```" in text:
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
 # ─── CSS ─────────────────────────────────────────────────────────────────────
 def apply_css():
     st.markdown("""
@@ -370,7 +409,54 @@ def page_diary(data):
 
     # ─── הוספת מזון ──────────────────────────────────────────────────────────
     st.markdown("<div class='section-header'>🍽️ ארוחות ואוכל</div>", unsafe_allow_html=True)
-    tab_a, tab_b = st.tabs(["רשימה מהירה", "הזנה ידנית"])
+    tab_a, tab_b, tab_photo = st.tabs(["רשימה מהירה", "הזנה ידנית", "📷 צילום"])
+
+    with tab_photo:
+        api_key_photo = st.session_state.get("anthropic_api_key", "")
+        if not api_key_photo:
+            st.info("הזן מפתח API בסרגל הצד כדי לזהות מזון מתמונה")
+        else:
+            st.caption("צלם את הצלחת שלך — Claude יזהה את המאכלים ויאמוד קלוריות")
+            img_source = st.radio("מקור תמונה", ["מצלמה", "גלריה"], horizontal=True, key="img_source")
+
+            uploaded = None
+            if img_source == "מצלמה":
+                uploaded = st.camera_input("צלם את הארוחה", key="food_camera")
+            else:
+                uploaded = st.file_uploader("בחר תמונה מהגלריה", type=["jpg", "jpeg", "png", "webp"], key="food_upload")
+
+            if uploaded and st.button("🔍 זהה מזון", key="analyze_photo", use_container_width=True, type="primary"):
+                with st.spinner("Claude מזהה את המאכלים..."):
+                    try:
+                        img_bytes = uploaded.getvalue()
+                        ext = uploaded.name.split(".")[-1].lower() if hasattr(uploaded, "name") else "jpeg"
+                        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+                        media_type = mime_map.get(ext, "image/jpeg")
+                        result = analyze_food_photo(img_bytes, media_type, api_key_photo)
+                        st.session_state["photo_items"] = result.get("items", [])
+                    except Exception as e:
+                        st.error(f"שגיאה בזיהוי: {e}")
+
+            if st.session_state.get("photo_items"):
+                st.markdown("**פריטים שזוהו — בחר מה להוסיף:**")
+                selected = []
+                for idx, item in enumerate(st.session_state["photo_items"]):
+                    col_chk, col_name, col_cal = st.columns([0.5, 3, 1.5])
+                    with col_chk:
+                        checked = st.checkbox("", value=True, key=f"photo_chk_{idx}")
+                    with col_name:
+                        item["name"] = st.text_input("", value=item["name"], key=f"photo_name_{idx}", label_visibility="collapsed")
+                    with col_cal:
+                        item["cal"] = st.number_input("", value=int(item["cal"]), min_value=0, max_value=5000, key=f"photo_cal_{idx}", label_visibility="collapsed")
+                    if checked:
+                        selected.append(item)
+
+                if st.button("✅ הוסף פריטים נבחרים", key="add_photo_items", use_container_width=True):
+                    for item in selected:
+                        day["food"].append({"name": item["name"], "cal": item["cal"], "qty": item.get("qty", 1)})
+                    save_data(data)
+                    st.session_state["photo_items"] = []
+                    st.rerun()
 
     with tab_a:
         category = st.selectbox("קטגוריה", list(COMMON_FOODS.keys()), key="food_cat")
